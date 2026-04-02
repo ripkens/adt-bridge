@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ADT Match – Board Bridge
 // @namespace    https://ad-team-matches.net
-// @version      6.0.0
+// @version      6.0.1
 // @description  Board Bridge: Intercepts autodarts.io WebSocket data and relays to ADT Match backend
 // @author       ADT Match
 // @match        https://play.autodarts.io/*
@@ -20,7 +20,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '6.0.0';
+    const VERSION = '6.0.1';
     const SERVER  = 'https://ad-team-matches.net';
 
     // ═════════════════════════════════════════════════════════════════════════
