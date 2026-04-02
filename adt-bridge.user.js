@@ -12,8 +12,8 @@
 // @connect      ad-team-matches.net
 // @connect      boards.ws.autodarts.io
 // @require      https://cdn.jsdelivr.net/npm/centrifuge@5/dist/centrifuge.min.js
-// @updateURL    https://raw.githubusercontent.com/ripkens/adt-bridge/main/adt-bridge.meta.js
-// @downloadURL  https://raw.githubusercontent.com/ripkens/adt-bridge/main/adt-bridge.user.js
+// @updateURL    https://ad-team-matches.net/scripts/adt-bridge.meta.js
+// @downloadURL  https://ad-team-matches.net/scripts/adt-bridge.user.js
 // @run-at       document-start
 // ==/UserScript==
 
@@ -63,21 +63,11 @@
     // ═════════════════════════════════════════════════════════════════════════
     function getAutodartsToken() {
         if (_capturedAdtToken) return _capturedAdtToken;
-        // Scan localStorage for JWTs
-        for (let i = 0; i < localStorage.length; i++) {
-            const val = localStorage.getItem(localStorage.key(i));
-            if (!val) continue;
-            if (val.startsWith('eyJ') && val.length > 100) return val;
-            try {
-                const p = JSON.parse(val);
-                if (p.access_token) return p.access_token;
-                if (p.token?.startsWith('eyJ')) return p.token;
-                for (const v of Object.values(p)) {
-                    if (typeof v === 'string' && v.startsWith('eyJ') && v.length > 100) return v;
-                    if (typeof v === 'object' && v?.access_token) return v.access_token;
-                }
-            } catch {}
-        }
+        // Check page context variable
+        try {
+            const t = unsafeWindow?.__ADT_TOKEN__ || window.__ADT_TOKEN__;
+            if (t) { _capturedAdtToken = t; return t; }
+        } catch {}
         return null;
     }
 
@@ -85,41 +75,82 @@
     // WebSocket Interceptor — captures ALL autodarts channels
     // ═════════════════════════════════════════════════════════════════════════
     function interceptWebSocket() {
-        const OrigWS = window.WebSocket;
-        window.WebSocket = function(url, protocols) {
-            const ws = new OrigWS(url, protocols);
-
-            if (url?.includes('autodarts')) {
-                ws.addEventListener('message', e => {
-                    try { handleWsMessage(url, e.data); } catch {}
-                });
-            }
-
-            return ws;
-        };
-        window.WebSocket.prototype = OrigWS.prototype;
-        window.WebSocket.CONNECTING = OrigWS.CONNECTING;
-        window.WebSocket.OPEN = OrigWS.OPEN;
-        window.WebSocket.CLOSING = OrigWS.CLOSING;
-        window.WebSocket.CLOSED = OrigWS.CLOSED;
-
-        // Also capture fetch for token + turn detection
-        const origFetch = window.fetch;
-        window.fetch = function(...args) {
-            try {
-                const [url, opts] = args;
-                if (typeof url === 'string' && url.includes('autodarts.io')) {
-                    // Capture token
-                    const auth = opts?.headers?.['Authorization'] || opts?.headers?.authorization;
-                    if (auth?.startsWith('Bearer ')) _capturedAdtToken = auth.substring(7);
-                    if (opts?.headers instanceof Headers) {
-                        const ah = opts.headers.get('Authorization');
-                        if (ah?.startsWith('Bearer ')) _capturedAdtToken = ah.substring(7);
+        // Inject interceptors into PAGE context (not TM sandbox)
+        // This is critical because autodarts.io fetch/WS runs in page scope
+        const script = document.createElement('script');
+        script.textContent = `
+        (function() {
+            // ── Capture autodarts Bearer token from fetch ──
+            const _origFetch = window.fetch;
+            window.fetch = function(...args) {
+                try {
+                    const [url, opts] = args;
+                    if (typeof url === 'string' && url.includes('autodarts.io')) {
+                        let auth = null;
+                        if (opts?.headers) {
+                            if (opts.headers instanceof Headers) auth = opts.headers.get('Authorization');
+                            else auth = opts.headers['Authorization'] || opts.headers['authorization'];
+                        }
+                        if (auth && auth.startsWith('Bearer ')) {
+                            window.__ADT_TOKEN__ = auth.substring(7);
+                        }
                     }
+                } catch {}
+                return _origFetch.apply(this, args);
+            };
+
+            // ── Capture from XMLHttpRequest too ──
+            const _origXhrOpen = XMLHttpRequest.prototype.open;
+            const _origXhrSetHeader = XMLHttpRequest.prototype.setRequestHeader;
+            XMLHttpRequest.prototype.open = function(method, url, ...rest) {
+                this._adtUrl = url;
+                return _origXhrOpen.call(this, method, url, ...rest);
+            };
+            XMLHttpRequest.prototype.setRequestHeader = function(name, value) {
+                if (this._adtUrl?.includes('autodarts.io') && name.toLowerCase() === 'authorization' && value.startsWith('Bearer ')) {
+                    window.__ADT_TOKEN__ = value.substring(7);
+                }
+                return _origXhrSetHeader.call(this, name, value);
+            };
+
+            // ── WebSocket interceptor ──
+            const _OrigWS = window.WebSocket;
+            window.WebSocket = function(url, protocols) {
+                const ws = new _OrigWS(url, protocols);
+                if (url && url.includes('autodarts')) {
+                    ws.addEventListener('message', function(e) {
+                        try {
+                            window.dispatchEvent(new CustomEvent('adt-ws-message', { detail: { url: url, data: e.data } }));
+                        } catch {}
+                    });
+                }
+                return ws;
+            };
+            window.WebSocket.prototype = _OrigWS.prototype;
+            window.WebSocket.CONNECTING = _OrigWS.CONNECTING;
+            window.WebSocket.OPEN = _OrigWS.OPEN;
+            window.WebSocket.CLOSING = _OrigWS.CLOSING;
+            window.WebSocket.CLOSED = _OrigWS.CLOSED;
+        })();
+        `;
+        document.documentElement.appendChild(script);
+        script.remove();
+
+        // Listen for WS messages from page context
+        window.addEventListener('adt-ws-message', e => {
+            try { handleWsMessage(e.detail.url, e.detail.data); } catch {}
+        });
+
+        // Poll for captured token from page context
+        setInterval(() => {
+            try {
+                const t = unsafeWindow?.__ADT_TOKEN__ || window.__ADT_TOKEN__;
+                if (t && t !== _capturedAdtToken) {
+                    _capturedAdtToken = t;
+                    console.log('[ADT Bridge] Autodarts token captured');
                 }
             } catch {}
-            return origFetch.apply(this, args);
-        };
+        }, 1000);
     }
 
     // ═════════════════════════════════════════════════════════════════════════
