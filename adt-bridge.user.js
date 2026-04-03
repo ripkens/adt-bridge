@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ADT Match – Board Bridge
 // @namespace    https://ad-team-matches.net
-// @version      6.4.0
+// @version      6.5.0
 // @description  Board Bridge: Intercepts autodarts.io WebSocket data and relays to ADT Match backend
 // @author       ADT Match
 // @match        https://play.autodarts.io/*
@@ -20,7 +20,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '6.4.0';
+    const VERSION = '6.5.0';
     const SERVER  = 'https://ad-team-matches.net';
 
     // ═════════════════════════════════════════════════════════════════════════
@@ -1157,6 +1157,36 @@
     }
 
     // ═════════════════════════════════════════════════════════════════════════
+    // Autodarts Stats Sync — fetch player stats and send to backend
+    // ═════════════════════════════════════════════════════════════════════════
+    let _statsSyncInterval = null;
+
+    async function syncAutodartsStats() {
+        const token = await ensureFreshAdtToken();
+        if (!token || !S.apiKey) return;
+
+        try {
+            const res = await fetch('https://api.autodarts.io/us/v0/profile/stats/x01?limit=100', {
+                headers: { Authorization: 'Bearer ' + token, Accept: 'application/json' },
+            });
+            if (!res.ok) return;
+            const stats = await res.json();
+            if (!stats || typeof stats !== 'object') return;
+
+            api('POST', '/api/user/autodarts-stats', { stats });
+            console.log('[ADT Bridge] Stats synced: avg=' + (stats.averageLast?.average?.toFixed(1) || '?'));
+        } catch (e) {
+            console.warn('[ADT Bridge] Stats sync failed:', e);
+        }
+    }
+
+    function startStatsSync() {
+        // Sync immediately, then every 10 minutes
+        setTimeout(syncAutodartsStats, 5000);
+        _statsSyncInterval = setInterval(syncAutodartsStats, 10 * 60 * 1000);
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
     // Init
     // ═════════════════════════════════════════════════════════════════════════
     console.log(`[ADT Bridge] v${VERSION}`);
@@ -1201,6 +1231,7 @@
                             S.connected = true;
                             showStatus();
                             connectCentrifugo();
+                            startStatsSync();
                         }
                     });
                     api('GET', '/api/user/boards').then(b => {
