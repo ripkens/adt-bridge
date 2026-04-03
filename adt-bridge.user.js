@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ADT Match – Board Bridge
 // @namespace    https://ad-team-matches.net
-// @version      6.5.1
+// @version      6.5.2
 // @description  Board Bridge: Intercepts autodarts.io WebSocket data and relays to ADT Match backend
 // @author       ADT Match
 // @match        https://play.autodarts.io/*
@@ -20,7 +20,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '6.5.1';
+    const VERSION = '6.5.2';
     const SERVER  = 'https://ad-team-matches.net';
 
     // ═════════════════════════════════════════════════════════════════════════
@@ -1194,7 +1194,7 @@
             if (!S.apiKey || !S.connected) return;
             const boardIds = (S.boards || []).map(bd => bd.id);
             api('POST', '/api/user/ping', { bridgeVersion: VERSION, boardIds });
-        }, 5 * 60 * 1000); // Every 5 minutes
+        }, 2 * 60 * 1000); // Every 2 minutes (shorter to survive browser throttling in background tabs)
     }
 
     // ═════════════════════════════════════════════════════════════════════════
