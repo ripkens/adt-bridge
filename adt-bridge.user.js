@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ADT Match – Board Bridge
 // @namespace    https://ad-team-matches.net
-// @version      6.5.2
+// @version      6.6.0
 // @description  Board Bridge: Intercepts autodarts.io WebSocket data and relays to ADT Match backend
 // @author       ADT Match
 // @match        https://play.autodarts.io/*
@@ -20,7 +20,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '6.5.2';
+    const VERSION = '6.6.0';
     const SERVER  = 'https://ad-team-matches.net';
 
     // ═════════════════════════════════════════════════════════════════════════
@@ -1189,12 +1189,22 @@
     // ═════════════════════════════════════════════════════════════════════════
     // Keepalive Ping — stay visible in "Online Spieler" even with inactive tab
     // ═════════════════════════════════════════════════════════════════════════
+    function isInMatch() {
+        const m = S.activeMatch;
+        return !!(m && m.id && !m.finished);
+    }
+
     function startKeepalive() {
         setInterval(() => {
             if (!S.apiKey || !S.connected) return;
             const boardIds = (S.boards || []).map(bd => bd.id);
-            api('POST', '/api/user/ping', { bridgeVersion: VERSION, boardIds });
-        }, 2 * 60 * 1000); // Every 2 minutes (shorter to survive browser throttling in background tabs)
+            api('POST', '/api/user/ping', {
+                bridgeVersion: VERSION,
+                boardIds,
+                inMatch: isInMatch(),
+                autodartsMatchId: S.activeMatch?.id || null,
+            });
+        }, 2 * 60 * 1000);
     }
 
     // ═════════════════════════════════════════════════════════════════════════
@@ -1227,7 +1237,7 @@
 
         // Connect to ADT backend
         if (S.apiKey) {
-            api('POST', '/api/user/ping', { bridgeVersion: VERSION, boardIds: [] }).then(r => {
+            api('POST', '/api/user/ping', { bridgeVersion: VERSION, boardIds: [], inMatch: isInMatch() }).then(r => {
                 if (r.ok) {
                     // Check minimum bridge version
                     const minVersion = r.data?.minBridgeVersion;
@@ -1254,6 +1264,7 @@
                                 api('POST', '/api/user/ping', {
                                     bridgeVersion: VERSION,
                                     boardIds: S.boards.map(bd => bd.id),
+                                    inMatch: isInMatch(),
                                 });
                             }
                         }
