@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ADT Match – Board Bridge
 // @namespace    https://ad-team-matches.net
-// @version      6.0.1
+// @version      6.4.0
 // @description  Board Bridge: Intercepts autodarts.io WebSocket data and relays to ADT Match backend
 // @author       ADT Match
 // @match        https://play.autodarts.io/*
@@ -12,15 +12,15 @@
 // @connect      ad-team-matches.net
 // @connect      boards.ws.autodarts.io
 // @require      https://cdn.jsdelivr.net/npm/centrifuge@5/dist/centrifuge.min.js
-// @updateURL    https://ad-team-matches.net/scripts/adt-bridge.meta.js
-// @downloadURL  https://ad-team-matches.net/scripts/adt-bridge.user.js
+// @updateURL    https://raw.githubusercontent.com/ripkens/adt-bridge/main/adt-bridge.meta.js
+// @downloadURL  https://raw.githubusercontent.com/ripkens/adt-bridge/main/adt-bridge.user.js
 // @run-at       document-start
 // ==/UserScript==
 
 (function () {
     'use strict';
 
-    const VERSION = '6.0.1';
+    const VERSION = '6.4.0';
     const SERVER  = 'https://ad-team-matches.net';
 
     // ═════════════════════════════════════════════════════════════════════════
@@ -37,6 +37,32 @@
     };
 
     let _capturedAdtToken = null;
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // Version Helpers
+    // ═════════════════════════════════════════════════════════════════════════
+    function compareVersions(a, b) {
+        const pa = a.split('.').map(Number);
+        const pb = b.split('.').map(Number);
+        for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+            const na = pa[i] || 0, nb = pb[i] || 0;
+            if (na < nb) return -1;
+            if (na > nb) return 1;
+        }
+        return 0;
+    }
+
+    function showUpdateBanner(minVersion) {
+        const poll = setInterval(() => {
+            if (!document.body) return;
+            clearInterval(poll);
+            const banner = document.createElement('div');
+            banner.id = 'adt-update-banner';
+            banner.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:999999;background:#F3486A;color:#fff;padding:10px 16px;font-family:Inter,sans-serif;font-size:13px;font-weight:700;text-align:center;display:flex;align-items:center;justify-content:center;gap:8px';
+            banner.innerHTML = `⚠️ ADT Bridge veraltet (v${VERSION}) — Mindestversion v${minVersion} erforderlich. <a href="https://raw.githubusercontent.com/ripkens/adt-bridge/main/adt-bridge.user.js" style="color:#fff;text-decoration:underline;font-weight:800">Jetzt updaten</a>`;
+            document.body.prepend(banner);
+        }, 200);
+    }
 
     // ═════════════════════════════════════════════════════════════════════════
     // API Helper
@@ -61,14 +87,91 @@
     // ═════════════════════════════════════════════════════════════════════════
     // Autodarts Token Capture
     // ═════════════════════════════════════════════════════════════════════════
+    let _adtTokenExpiry = 0;
+
     function getAutodartsToken() {
-        if (_capturedAdtToken) return _capturedAdtToken;
-        // Check page context variable
+        // Always read the latest token from page context (refreshed by fetch intercept)
         try {
             const t = unsafeWindow?.__ADT_TOKEN__ || window.__ADT_TOKEN__;
-            if (t) { _capturedAdtToken = t; return t; }
+            if (t && t !== _capturedAdtToken) {
+                _capturedAdtToken = t;
+                // Parse JWT expiry
+                try {
+                    const payload = JSON.parse(atob(t.split('.')[1]));
+                    _adtTokenExpiry = (payload.exp || 0) * 1000;
+                } catch {}
+            }
         } catch {}
-        return null;
+        return _capturedAdtToken || null;
+    }
+
+    function isAdtTokenExpired() {
+        return !_adtTokenExpiry || Date.now() > _adtTokenExpiry - 30000; // 30s buffer
+    }
+
+    /**
+     * Refresh autodarts token via Keycloak if expired.
+     * Reads refresh_token from localStorage (stored by autodarts OIDC client).
+     */
+    async function ensureFreshAdtToken() {
+        const current = getAutodartsToken();
+        if (current && !isAdtTokenExpired()) return current;
+
+        // Try to find refresh token in localStorage
+        let refreshToken = null;
+        try {
+            const win = unsafeWindow || window;
+            for (let i = 0; i < win.localStorage.length; i++) {
+                const key = win.localStorage.key(i);
+                const val = win.localStorage.getItem(key);
+                if (val && (key.includes('keycloak') || key.includes('oidc') || key.includes('token'))) {
+                    try {
+                        const parsed = JSON.parse(val);
+                        if (parsed.refresh_token) { refreshToken = parsed.refresh_token; break; }
+                    } catch {
+                        if (val.startsWith('eyJ') && val.length > 500 && !refreshToken) refreshToken = val;
+                    }
+                }
+            }
+        } catch {}
+
+        if (!refreshToken) {
+            console.warn('[ADT Bridge] No refresh token found in localStorage');
+            return current;
+        }
+
+        // Call Keycloak token endpoint
+        try {
+            const res = await fetch('https://login.autodarts.io/realms/autodarts/protocol/openid-connect/token', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                body: new URLSearchParams({
+                    grant_type: 'refresh_token',
+                    client_id: 'autodarts-play',
+                    refresh_token: refreshToken,
+                }),
+            });
+            if (res.ok) {
+                const data = await res.json();
+                if (data.access_token) {
+                    _capturedAdtToken = data.access_token;
+                    try {
+                        const win = unsafeWindow || window;
+                        win.__ADT_TOKEN__ = data.access_token;
+                    } catch {}
+                    const payload = JSON.parse(atob(data.access_token.split('.')[1]));
+                    _adtTokenExpiry = (payload.exp || 0) * 1000;
+                    console.log('[ADT Bridge] Token refreshed via Keycloak, expires:', new Date(_adtTokenExpiry).toLocaleTimeString());
+                    return data.access_token;
+                }
+            } else {
+                console.warn('[ADT Bridge] Keycloak refresh failed:', res.status);
+            }
+        } catch (e) {
+            console.warn('[ADT Bridge] Keycloak refresh error:', e);
+        }
+
+        return current;
     }
 
     // ═════════════════════════════════════════════════════════════════════════
@@ -82,28 +185,53 @@
         (function() {
             // ── Capture autodarts Bearer token from fetch ──
             const _origFetch = window.fetch;
+            const _keycloakTokenUrl = 'https://login.autodarts.io/realms/autodarts/protocol/openid-connect/token';
             window.fetch = function(...args) {
+                const [url, opts] = typeof args[0] === 'string' ? [args[0], args[1]] : [args[0]?.url, args[1]];
+                const promise = _origFetch.apply(this, args);
                 try {
-                    const [url, opts] = args;
-                    if (typeof url === 'string' && url.includes('autodarts.io')) {
-                        let auth = null;
-                        if (opts?.headers) {
-                            if (opts.headers instanceof Headers) auth = opts.headers.get('Authorization');
-                            else auth = opts.headers['Authorization'] || opts.headers['authorization'];
+                    if (typeof url === 'string') {
+                        // Capture token from Keycloak token endpoint response (initial login + silent refresh)
+                        if (url.startsWith(_keycloakTokenUrl)) {
+                            promise.then(res => res.clone().json().then(body => {
+                                if (body.access_token) {
+                                    window.__ADT_TOKEN__ = body.access_token;
+                                    window.dispatchEvent(new CustomEvent('adt-token-refresh', { detail: { token: body.access_token } }));
+                                }
+                            }).catch(() => {})).catch(() => {});
                         }
-                        if (auth && auth.startsWith('Bearer ')) {
-                            window.__ADT_TOKEN__ = auth.substring(7);
+                        // Also capture Bearer token from autodarts API calls (fallback)
+                        if (url.includes('autodarts.io')) {
+                            let auth = null;
+                            if (opts?.headers) {
+                                if (opts.headers instanceof Headers) auth = opts.headers.get('Authorization');
+                                else auth = opts.headers['Authorization'] || opts.headers['authorization'];
+                            }
+                            if (auth && auth.startsWith('Bearer ')) {
+                                window.__ADT_TOKEN__ = auth.substring(7);
+                            }
+                        }
+                        // Detect game actions (works with both absolute and relative URLs)
+                        if (opts?.method === 'POST') {
+                            if (url.includes('/players/next')) {
+                                window.dispatchEvent(new CustomEvent('adt-players-next', { detail: { url } }));
+                            }
+                            if (url.endsWith('/undo')) {
+                                window.dispatchEvent(new CustomEvent('adt-undo', { detail: { url } }));
+                            }
                         }
                     }
                 } catch {}
-                return _origFetch.apply(this, args);
+                return promise;
             };
 
             // ── Capture from XMLHttpRequest too ──
             const _origXhrOpen = XMLHttpRequest.prototype.open;
+            const _origXhrSend = XMLHttpRequest.prototype.send;
             const _origXhrSetHeader = XMLHttpRequest.prototype.setRequestHeader;
             XMLHttpRequest.prototype.open = function(method, url, ...rest) {
                 this._adtUrl = url;
+                this._adtMethod = method;
                 return _origXhrOpen.call(this, method, url, ...rest);
             };
             XMLHttpRequest.prototype.setRequestHeader = function(name, value) {
@@ -111,6 +239,18 @@
                     window.__ADT_TOKEN__ = value.substring(7);
                 }
                 return _origXhrSetHeader.call(this, name, value);
+            };
+            XMLHttpRequest.prototype.send = function(...args) {
+                // Detect game actions via XHR (URL may be relative or absolute)
+                if (this._adtMethod === 'POST' && this._adtUrl) {
+                    if (this._adtUrl.includes('/players/next')) {
+                        window.dispatchEvent(new CustomEvent('adt-players-next', { detail: { url: this._adtUrl } }));
+                    }
+                    if (this._adtUrl.endsWith('/undo')) {
+                        window.dispatchEvent(new CustomEvent('adt-undo', { detail: { url: this._adtUrl } }));
+                    }
+                }
+                return _origXhrSend.apply(this, args);
             };
 
             // ── WebSocket interceptor ──
@@ -141,13 +281,38 @@
             try { handleWsMessage(e.detail.url, e.detail.data); } catch {}
         });
 
-        // Poll for captured token from page context
+        // Listen for Next/Undo API calls (intercepted from fetch + XHR)
+        window.addEventListener('adt-players-next', () => {
+            handlePlayersNext();
+        });
+        window.addEventListener('adt-undo', () => {
+            handleUndo();
+        });
+
+        // Listen for token refresh from Keycloak intercept (most reliable)
+        window.addEventListener('adt-token-refresh', e => {
+            const t = e.detail?.token;
+            if (t && t !== _capturedAdtToken) {
+                _capturedAdtToken = t;
+                try {
+                    const payload = JSON.parse(atob(t.split('.')[1]));
+                    _adtTokenExpiry = (payload.exp || 0) * 1000;
+                } catch {}
+                console.log('[ADT Bridge] Token refreshed via Keycloak intercept, expires:', new Date(_adtTokenExpiry).toLocaleTimeString());
+            }
+        });
+
+        // Poll for captured token from page context (fallback)
         setInterval(() => {
             try {
                 const t = unsafeWindow?.__ADT_TOKEN__ || window.__ADT_TOKEN__;
                 if (t && t !== _capturedAdtToken) {
                     _capturedAdtToken = t;
-                    console.log('[ADT Bridge] Autodarts token captured');
+                    try {
+                        const payload = JSON.parse(atob(t.split('.')[1]));
+                        _adtTokenExpiry = (payload.exp || 0) * 1000;
+                    } catch {}
+                    console.log('[ADT Bridge] Autodarts token captured (poll)');
                 }
             } catch {}
         }, 1000);
@@ -194,17 +359,61 @@
         if (match.body) return; // Skip activation messages without data
         if (!match.id) return;
 
+        const isBullOff = match.variant && match.variant !== 'X01';
         const prev = S.activeMatch;
         S.activeMatch = match;
 
-        // Detect new throw (turns array grew)
-        const prevTurns = prev?.turns?.length ?? 0;
+        // If autodarts match ID changed (e.g. Bull-off → X01), reset comparison baseline
+        const sameMatch = prev && prev.id === match.id;
+
+        // ── Bull-off: only track who won, nothing else ──
+        if (isBullOff) {
+            if (match.gameFinished && match.gameWinner >= 0) {
+                const key = match.id + '-bulloff';
+                if (!_dedup[key]) {
+                    _dedup[key] = true;
+                    const winner = match.players?.[match.gameWinner];
+                    api('POST', '/api/events/bulloff', {
+                        autodartsMatchId: match.id,
+                        teamMatchId:      S.matchId,
+                        boardId:          S.boardId,
+                        winnerIndex:      match.gameWinner,
+                        winnerName:       winner?.name || '?',
+                        playerNames:      (match.players || []).map(p => p.name || '?'),
+                    });
+                    console.log(`[ADT Bridge] Bull-off won by: ${winner?.name}`);
+                }
+            }
+            return; // Skip all other tracking for Bull-off
+        }
+
+        // ── Track individual throws ──
         const currTurns = match.turns?.length ?? 0;
 
-        if (currTurns > prevTurns && currTurns > 0) {
-            const newTurn = match.turns[currTurns - 1];
-            sendTurnData(match, newTurn);
+        if (currTurns > 0 && !_suppressThrows) {
+            const currLastTurn = match.turns[currTurns - 1];
+            const currThrowCount = currLastTurn?.throws?.length ?? 0;
+            const prevLastTurn = sameMatch && prev?.turns?.length >= currTurns ? prev.turns[currTurns - 1] : null;
+            const prevThrowCount = prevLastTurn?.throws?.length ?? 0;
+
+            // New dart landed → broadcast for live display (not stored, may be corrected)
+            if (currThrowCount > prevThrowCount && currThrowCount > 0) {
+                const newThrow = currLastTurn.throws[currThrowCount - 1];
+                console.log(`[ADT Bridge] Throw: ${newThrow?.segment?.name || '?'} (dart ${currThrowCount}/3, R${currLastTurn.round})`);
+                sendThrowData(match, currLastTurn, newThrow, currThrowCount);
+                setTimeout(fetchAndSendMatchState, 500);
+                // New dart thrown = no longer in "undo after next" window
+                _lastSentTurn = null;
+            }
+
+            // Dart removed (Undo within turn) → broadcast correction
+            if (sameMatch && currThrowCount < prevThrowCount) {
+                console.log(`[ADT Bridge] Undo: dart removed (now ${currThrowCount} darts, R${currLastTurn.round})`);
+                // TODO: broadcast undo event to Play-App
+            }
         }
+
+        // Turn completion is handled by handlePlayersNext() via fetch intercept of POST /players/next
 
         // Detect GameShot (leg finished)
         if (match.gameFinished && match.gameWinner >= 0) {
@@ -233,6 +442,134 @@
         updatePlayerBadges(match);
     }
 
+    // Track last sent turn so we can revert it on undo-after-next
+    let _lastSentTurn = null;
+    let _suppressThrows = false;
+
+    /**
+     * Triggered when POST /undo is intercepted.
+     * If a turn was just sent (undo after next), revert it in the backend.
+     */
+    function handleUndo() {
+        if (_lastSentTurn) {
+            // Undo happened after a Next → revert the turn in backend
+            const t = _lastSentTurn;
+            console.log(`[ADT Bridge] Undo after Next → reverting turn R${t.round} T${t.turn}`);
+            api('POST', '/api/events/undo-turn', {
+                autodartsMatchId: t.autodartsMatchId,
+                teamMatchId:      S.matchId,
+                round:            t.round,
+                turnIndex:        t.turn,
+                set:              t.set,
+                leg:              t.leg,
+            });
+            // Remove dedup so the corrected turn can be sent again
+            const match = S.activeMatch;
+            if (match) {
+                delete _dedup[match.id + '-t-' + t.round + '-' + t.turn];
+            }
+            _lastSentTurn = null;
+            // Suppress throw detection for next WS updates (state restoration, not new darts)
+            _suppressThrows = true;
+            setTimeout(() => { _suppressThrows = false; }, 2000);
+        } else {
+            console.log('[ADT Bridge] Undo (dart correction)');
+        }
+        setTimeout(fetchAndSendMatchState, 500);
+    }
+
+    /**
+     * Triggered when POST /players/next is intercepted (Next button or darts pulled).
+     * Reads the current (now completed) turn from S.activeMatch and sends it to backend.
+     */
+    function handlePlayersNext() {
+        const match = S.activeMatch;
+        if (!match?.turns?.length) return;
+
+        const currTurn = match.turns[match.turns.length - 1];
+        if (!currTurn?.throws?.length) return;
+
+        const dedupKey = match.id + '-t-' + currTurn.round + '-' + currTurn.turn;
+        if (_dedup[dedupKey]) return;
+        _dedup[dedupKey] = true;
+
+        sendTurnData(match, currTurn);
+        // Track for potential undo-after-next (cleared when new dart is thrown)
+        _lastSentTurn = {
+            autodartsMatchId: match.id,
+            round: currTurn.round,
+            turn: currTurn.turn,
+            set: match.set,
+            leg: match.leg,
+        };
+
+        console.log(`[ADT Bridge] Next → Turn sent: R${currTurn.round} T${currTurn.turn} = ${currTurn.score}pts (${currTurn.throws.length} darts)`);
+        setTimeout(fetchAndSendMatchState, 500);
+    }
+
+    /**
+     * Fetch full match state from autodarts REST API and send to backend.
+     * Called after throw/next/undo to get checkoutGuide, chalkboards etc.
+     */
+    async function fetchAndSendMatchState() {
+        const match = S.activeMatch;
+        if (!match?.id || !S.matchId) return;
+
+        const token = getAutodartsToken();
+        if (!token) return;
+
+        try {
+            const res = await fetch(`https://api.autodarts.io/gs/v0/matches/${match.id}/state`, {
+                headers: { Authorization: 'Bearer ' + token, Accept: 'application/json' },
+            });
+            if (!res.ok) return;
+            const state = await res.json();
+
+            // Send full state to backend (store everything, display what we need)
+            api('POST', '/api/events/stats', {
+                autodartsMatchId: match.id,
+                teamMatchId:      S.matchId,
+                boardId:          S.boardId,
+                fullState:        state,
+                // Keep flat fields for Centrifugo broadcast
+                stats:            state.stats || [],
+                scores:           state.scores || [],
+                chalkboards:      state.chalkboards || [],
+                gameScores:       state.gameScores || [],
+                players:          (state.players || []).map(p => ({ id: p.id, index: p.index, name: p.name })),
+                checkoutGuide:    state.state?.checkoutGuide || [],
+                activePlayer:     state.player,
+                winner:           state.finished ? state.winner : null,
+                finished:         state.finished || false,
+                set:              state.set,
+                leg:              state.leg,
+            });
+        } catch (e) {
+            // Silently fail — non-critical
+        }
+    }
+
+    function sendThrowData(match, turn, throwData, dartIndex) {
+        api('POST', '/api/events/throw', {
+            autodartsMatchId: match.id,
+            teamMatchId:      S.matchId,
+            boardId:          S.boardId,
+            round:            turn.round,
+            turnIndex:        turn.turn,
+            playerId:         turn.playerId,
+            dartIndex:        dartIndex,
+            segment:          throwData.segment || null,
+            coords:           throwData.coords || null,
+            entry:            throwData.entry || null,
+            createdAt:        throwData.createdAt || null,
+            gameScores:       match.gameScores || [],
+            checkoutGuide:    match.state?.checkoutGuide || [],
+            activePlayer:     match.player,
+            set:              match.set,
+            leg:              match.leg,
+        });
+    }
+
     function sendTurnData(match, turn) {
         const throws = (turn.throws || []).map(t => ({
             index:     t.throw,
@@ -242,6 +579,15 @@
             createdAt: t.createdAt || null,
         }));
 
+        // Resolve player name from match.players
+        let player = (match.players || []).find(p => p.id === turn.playerId || p.userId === turn.playerId);
+        // Fallback: use turn index (turn.turn matches player index in 2-player match)
+        if (!player && turn.turn !== undefined && match.players?.[turn.turn]) {
+            player = match.players[turn.turn];
+        }
+        const playerName = player?.name || null;
+        console.log(`[ADT Bridge] Turn player resolved: playerId=${turn.playerId} turn=${turn.turn} → ${playerName || 'UNKNOWN'}`);
+
         api('POST', '/api/events/turn', {
             autodartsMatchId: match.id,
             teamMatchId:      S.matchId,
@@ -249,6 +595,7 @@
             round:            turn.round,
             turnIndex:        turn.turn,
             playerId:         turn.playerId,
+            playerName:       playerName,
             score:            turn.score,
             points:           turn.points,
             busted:           turn.busted || false,
@@ -262,9 +609,23 @@
         console.log(`[ADT Bridge] Turn: R${turn.round} P${turn.playerId} = ${turn.score}pts (${throws.length} darts)`);
     }
 
-    function sendGameShot(match, legKey) {
+    async function sendGameShot(match, legKey) {
         const winner = match.players?.[match.gameWinner];
         const playerNames = (match.players || []).map(p => p.name || '?');
+
+        // Fetch full match state from autodarts REST API for accurate stats
+        let fullState = null;
+        const token = getAutodartsToken();
+        if (token && match.id) {
+            try {
+                const res = await fetch(`https://api.autodarts.io/gs/v0/matches/${match.id}/state`, {
+                    headers: { Authorization: 'Bearer ' + token, Accept: 'application/json' },
+                });
+                if (res.ok) fullState = await res.json();
+            } catch (e) {
+                console.warn('[ADT Bridge] Failed to fetch match state for gameshot:', e);
+            }
+        }
 
         api('POST', '/api/events/gameshot', {
             autodartsMatchId: match.id,
@@ -278,26 +639,62 @@
             winnerPlayerId:   winner?.userId || winner?.id || null,
             playerNames:      playerNames,
             gameScores:       match.gameScores || [],
-            stats:            match.stats || [],
+            stats:            fullState?.stats || match.stats || [],
+            scores:           fullState?.scores || match.scores || [],
+            players:          (fullState?.players || match.players || []).map(p => ({
+                id: p.id, index: p.index, name: p.name, userId: p.userId,
+            })),
+            fullState:        fullState,
         });
 
-        console.log(`[ADT Bridge] GameShot! ${winner?.name} wins S${match.set}/L${match.leg}`);
+        console.log(`[ADT Bridge] GameShot! ${winner?.name} wins S${match.set}/L${match.leg}` + (fullState ? ' (with full state)' : ''));
     }
 
-    function sendMatchFinished(match) {
-        const winner = match.players?.[match.winner];
+    async function sendMatchFinished(match) {
+        // Resolve winner by scores (most sets), not player index (may be swapped)
+        let winnerName = '?';
+        let winnerIndex = match.winner;
+        const scores = match.scores || [];
+        if (scores.length >= 2) {
+            const maxSets = Math.max(scores[0]?.sets || 0, scores[1]?.sets || 0);
+            const winIdx = scores.findIndex(s => (s.sets || 0) === maxSets);
+            if (winIdx >= 0 && match.players?.[winIdx]) {
+                winnerName = match.players[winIdx].name || '?';
+                winnerIndex = winIdx;
+            }
+        } else if (match.players?.[match.winner]) {
+            winnerName = match.players[match.winner].name || '?';
+        }
+
+        // Fetch full match state for final stats snapshot
+        let fullState = null;
+        const token = getAutodartsToken();
+        if (token && match.id) {
+            try {
+                const res = await fetch(`https://api.autodarts.io/gs/v0/matches/${match.id}/state`, {
+                    headers: { Authorization: 'Bearer ' + token, Accept: 'application/json' },
+                });
+                if (res.ok) fullState = await res.json();
+            } catch (e) {
+                console.warn('[ADT Bridge] Failed to fetch match state for match-finished:', e);
+            }
+        }
 
         api('POST', '/api/events/match-finished', {
             autodartsMatchId: match.id,
             teamMatchId:      S.matchId,
             boardId:          S.boardId,
-            winnerIndex:      match.winner,
-            winnerName:       winner?.name || '?',
-            scores:           match.scores || [],
-            stats:            match.stats || [],
+            winnerIndex:      winnerIndex,
+            winnerName:       winnerName,
+            scores:           fullState?.scores || scores,
+            stats:            fullState?.stats || match.stats || [],
+            players:          (fullState?.players || match.players || []).map(p => ({
+                id: p.id, index: p.index, name: p.name, userId: p.userId,
+            })),
+            fullState:        fullState,
         });
 
-        console.log(`[ADT Bridge] Match finished! Winner: ${winner?.name}`);
+        console.log(`[ADT Bridge] Match finished! Winner: ${winnerName}` + (fullState ? ' (with full state)' : ''));
     }
 
     function sendStatsUpdate(match) {
@@ -314,6 +711,9 @@
             scores:           match.scores,
             chalkboards:      match.chalkboards || [],
             gameScores:       match.gameScores || [],
+            players:          (match.players || []).map(p => ({ id: p.id, index: p.index, name: p.name })),
+            checkoutGuide:    match.state?.checkoutGuide || [],
+            activePlayer:     match.player,
             set:              match.set,
             leg:              match.leg,
         });
@@ -556,53 +956,76 @@
     // Autodarts Lobby/Match Control
     // ═════════════════════════════════════════════════════════════════════════
     async function createAutodartsLobby(cmd) {
-        const token = getAutodartsToken();
+        const token = await ensureFreshAdtToken();
         if (!token) { console.warn('[ADT Bridge] No autodarts token'); return; }
 
         const ADT_API = 'https://api.autodarts.io/gs/v0';
         const headers = { 'Content-Type': 'application/json', Authorization: 'Bearer ' + token, Accept: 'application/json' };
 
+        // Resolve real board ID (from user's saved boards, not "any")
+        const realBoardId = (cmd.boardId && cmd.boardId !== 'any') ? cmd.boardId
+            : S.boards?.[0]?.id || null;
+
         try {
+            // 1. Create lobby
+            const lobbyBody = {
+                variant: cmd.variant || 'X01',
+                settings: {
+                    baseScore: cmd.baseScore || 501,
+                    inMode: cmd.inMode || 'Straight',
+                    outMode: cmd.outMode || 'Double',
+                    bullMode: cmd.bullMode || '25/50',
+                    maxRounds: 50,
+                },
+                bullOffMode: cmd.bullOffMode || 'Normal',
+                isPrivate: true,
+                sets: cmd.sets || 3,
+                legs: cmd.legs || 2,
+            };
+            console.log('[ADT Bridge] Creating lobby:', JSON.stringify(lobbyBody));
             const lobbyRes = await fetch(ADT_API + '/lobbies', {
                 method: 'POST', headers,
-                body: JSON.stringify({
-                    variant: cmd.variant || 'X01',
-                    settings: {
-                        baseScore: cmd.baseScore || 501,
-                        inMode: cmd.inMode || 'Straight',
-                        outMode: cmd.outMode || 'Double',
-                        bullMode: cmd.bullMode || '25/50',
-                        maxRounds: 50,
-                    },
-                    bullOffMode: cmd.bullOffMode || 'Normal',
-                    isPrivate: true,
-                    sets: cmd.sets || 3,
-                    legs: cmd.legs || 2,
-                }),
+                body: JSON.stringify(lobbyBody),
             });
 
-            if (!lobbyRes.ok) { console.warn('[ADT Bridge] Lobby create failed:', lobbyRes.status); return; }
+            if (!lobbyRes.ok) {
+                const errText = await lobbyRes.text();
+                console.warn('[ADT Bridge] Lobby create failed:', lobbyRes.status, errText);
+                return;
+            }
             const lobby = await lobbyRes.json();
+            console.log('[ADT Bridge] Lobby created:', lobby.id);
 
-            // Add players
+            // 2. Add players (team names as player names, with board ID)
             for (const team of (cmd.teams || [])) {
-                await fetch(ADT_API + '/lobbies/' + lobby.id + '/players', {
+                const playerBody = { name: team.name };
+                if (realBoardId) playerBody.boardId = realBoardId;
+                console.log('[ADT Bridge] Adding player:', JSON.stringify(playerBody));
+                const pRes = await fetch(ADT_API + '/lobbies/' + lobby.id + '/players', {
                     method: 'POST', headers,
-                    body: JSON.stringify({ name: team.name, boardId: cmd.boardId }),
+                    body: JSON.stringify(playerBody),
                 });
+                if (!pRes.ok) {
+                    const errText = await pRes.text();
+                    console.warn('[ADT Bridge] Player add failed:', pRes.status, errText);
+                }
             }
 
-            // Start
+            // 3. Start
+            console.log('[ADT Bridge] Starting lobby...');
             const startRes = await fetch(ADT_API + '/lobbies/' + lobby.id + '/start', { method: 'POST', headers });
             if (startRes.ok) {
                 const matchData = await startRes.json();
                 S.matchId = cmd.teamMatchId;
-                S.boardId = cmd.boardId;
+                S.boardId = realBoardId || cmd.boardId;
                 GM_setValue('adt_active_match', JSON.stringify({ matchId: S.matchId, boardId: S.boardId }));
-                console.log('[ADT Bridge] Match started:', lobby.id);
+                console.log('[ADT Bridge] Match started! Lobby:', lobby.id, 'Board:', S.boardId);
 
                 // Navigate to match
                 window.location.href = '/matches/' + lobby.id;
+            } else {
+                const errText = await startRes.text();
+                console.warn('[ADT Bridge] Lobby start failed:', startRes.status, errText);
             }
         } catch (e) {
             console.error('[ADT Bridge] Lobby error:', e);
@@ -763,8 +1186,15 @@
 
         // Connect to ADT backend
         if (S.apiKey) {
-            api('POST', '/api/user/ping').then(r => {
+            api('POST', '/api/user/ping', { bridgeVersion: VERSION, boardIds: [] }).then(r => {
                 if (r.ok) {
+                    // Check minimum bridge version
+                    const minVersion = r.data?.minBridgeVersion;
+                    if (minVersion && compareVersions(VERSION, minVersion) < 0) {
+                        S.outdated = true;
+                        showUpdateBanner(minVersion);
+                    }
+
                     api('GET', '/api/user/me').then(me => {
                         if (me.ok) {
                             S.user = me.data;
@@ -774,7 +1204,16 @@
                         }
                     });
                     api('GET', '/api/user/boards').then(b => {
-                        if (b.ok) S.boards = b.data || [];
+                        if (b.ok) {
+                            S.boards = b.data || [];
+                            // Re-ping with board IDs to register bridge version per board
+                            if (S.boards.length) {
+                                api('POST', '/api/user/ping', {
+                                    bridgeVersion: VERSION,
+                                    boardIds: S.boards.map(bd => bd.id),
+                                });
+                            }
+                        }
                     });
                 } else {
                     showStatus();
