@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ADT Match – Board Bridge
 // @namespace    https://ad-team-matches.net
-// @version      6.5.0
+// @version      6.5.1
 // @description  Board Bridge: Intercepts autodarts.io WebSocket data and relays to ADT Match backend
 // @author       ADT Match
 // @match        https://play.autodarts.io/*
@@ -20,7 +20,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '6.5.0';
+    const VERSION = '6.5.1';
     const SERVER  = 'https://ad-team-matches.net';
 
     // ═════════════════════════════════════════════════════════════════════════
@@ -1187,6 +1187,17 @@
     }
 
     // ═════════════════════════════════════════════════════════════════════════
+    // Keepalive Ping — stay visible in "Online Spieler" even with inactive tab
+    // ═════════════════════════════════════════════════════════════════════════
+    function startKeepalive() {
+        setInterval(() => {
+            if (!S.apiKey || !S.connected) return;
+            const boardIds = (S.boards || []).map(bd => bd.id);
+            api('POST', '/api/user/ping', { bridgeVersion: VERSION, boardIds });
+        }, 5 * 60 * 1000); // Every 5 minutes
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
     // Init
     // ═════════════════════════════════════════════════════════════════════════
     console.log(`[ADT Bridge] v${VERSION}`);
@@ -1232,6 +1243,7 @@
                             showStatus();
                             connectCentrifugo();
                             startStatsSync();
+                            startKeepalive();
                         }
                     });
                     api('GET', '/api/user/boards').then(b => {
